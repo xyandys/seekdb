@@ -35,7 +35,18 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
   h->ip->build_algo = NN_DESCENT;
   h->ip->graph_degree = 128;
   h->ip->intermediate_graph_degree = 256;
-  h->ip->nn_descent_niter = 100;
+  /* NN-descent iterations dominate build time (~0.30 s/iter + ~9 s fixed on
+   * SIFT250K/gfx1100) and 250K-scale graphs converge long before 100 rounds:
+   * 15 iterations still gives recall@10 = 1.0000 / recall@100 = 0.9977 while
+   * cutting CREATE INDEX from 41.2 s to 13.1 s (3.14x).  SEEKDB_CUVS_NITER
+   * overrides the default for larger or harder datasets. */
+  {
+    const char* nit = getenv("SEEKDB_CUVS_NITER");
+    long nit_v = (nit && *nit) ? strtol(nit, NULL, 10) : 15;
+    if (nit_v < 1) nit_v = 1;
+    if (nit_v > 1000) nit_v = 1000;
+    h->ip->nn_descent_niter = (size_t)nit_v;
+  }
   if (cuvsCagraIndexCreate(&h->idx)      != CUVS_SUCCESS) goto fail_ip;
   if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;
   h->n = n; h->dim = dim;
@@ -68,13 +79,23 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
     dt=qt; dt.dl_tensor.data=dd; dt.dl_tensor.dtype.code=kDLFloat; dt.dl_tensor.shape=dsh;
     if (cuvsCagraSearchParamsCreate(&sp) != CUVS_SUCCESS) { rc=14; goto done; }
     {
+      /* itopk drives search latency almost linearly: 512 -> 2.75 ms,
+       * 256 -> 1.25 ms, 128 -> 0.70 ms (P50, top-10, SIFT250K).  128 loses
+       * recall@10 (0.9852, -0.0148 > the 0.005 gate); 256 keeps recall@10 at
+       * 1.0000 and recall@100 at 0.9977, so the floor is 256. */
+      const char* ito = getenv("SEEKDB_CUVS_ITOPK");
+      long ito_v = (ito && *ito) ? strtol(ito, NULL, 10) : 0;
       size_t required_itopk = (size_t)topk * 4;
-      if (required_itopk < 512) required_itopk = 512;
+      if (ito_v > 0) required_itopk = (size_t)ito_v;
+      if (ito_v <= 0 && required_itopk < 256) required_itopk = 256;
       if (sp->itopk_size < required_itopk) sp->itopk_size = required_itopk;
       sp->search_width = 4;
     }
     cuvsFilter f; f.type=NO_FILTER; f.addr=(uintptr_t)0;
     if (cuvsCagraSearch(h->res, sp, h->idx, &qt, &nt, &dt, f) != CUVS_SUCCESS) { rc=15; goto done; }
+    /* cuvsCagraSearch is asynchronous on the cuVS stream; without this the
+     * cudaMemcpy below races the kernel (garbage/instable ids on large n). */
+    cudaDeviceSynchronize();
     if (cudaMemcpy(out_ids, nd, sizeof(unsigned)*nq*topk, cudaMemcpyDefault) != cudaSuccess) { rc=16; goto done; }
     if (out_dist) cudaMemcpy(out_dist, dd, sizeof(float)*nq*topk, cudaMemcpyDefault);
   }
